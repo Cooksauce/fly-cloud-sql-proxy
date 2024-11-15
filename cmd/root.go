@@ -452,6 +452,12 @@ func NewCommand(opts ...Option) *Command {
 		"Use service account key file as a source of IAM credentials.")
 	localFlags.StringVarP(&c.conf.CredentialsJSON, "json-credentials", "j", "",
 		"Use service account key JSON as a source of IAM credentials.")
+	localFlags.StringVar(&c.conf.ExtCredentialsAccount, "ext-credentials-account", "",
+		"Use service account to do federated workload authentication.")
+	localFlags.StringVar(&c.conf.ExtCredentialsAudience, "ext-credentials-audience", "",
+		"Use audience when doing federated workload authentication.")
+	localFlags.StringVar(&c.conf.ExtCredentialsTokenUrl, "ext-credentials-token-url", "",
+		"Use token url to use when doing federated workload authentication.")
 	localFlags.BoolVarP(&c.conf.GcloudAuth, "gcloud-auth", "g", false,
 		`Use gclouds user credentials as a source of IAM credentials.
 NOTE: this flag is a legacy feature and generally should not be used.
@@ -773,6 +779,18 @@ func parseConfig(cmd *Command, conf *proxy.Config, args []string) error {
 		return newBadCommandError("cannot specify --json-credentials and --gcloud-auth flags at the same time")
 	}
 
+	multLen := len(conf.ExtCredentialsAccount) * len(conf.ExtCredentialsAudience) * len(conf.ExtCredentialsTokenUrl)
+
+	if conf.ExtCredentialsAccount != "" && multLen == 0 {
+		return newBadCommandError("--ext-credentials-account, --ext-credentials-audience, and --ext-credentials-token-url must used together")
+	}
+	if conf.ExtCredentialsAudience != "" && multLen == 0 {
+		return newBadCommandError("--ext-credentials-account, --ext-credentials-audience, and --ext-credentials-token-url must used together")
+	}
+	if conf.ExtCredentialsTokenUrl != "" && multLen == 0 {
+		return newBadCommandError("--ext-credentials-account, --ext-credentials-audience, and --ext-credentials-token-url must used together")
+	}
+
 	// When using token with auto-iam-authn, login-token must also be set.
 	// All three are required together.
 	if conf.IAMAuthN && conf.Token != "" && conf.LoginToken == "" {
@@ -1026,13 +1044,14 @@ func runSignalWrapper(cmd *Command) (err error) {
 	startCh := make(chan *proxy.Client)
 	go func() {
 		defer close(startCh)
-		p, err := proxy.NewClient(ctx, cmd.dialer, cmd.logger, cmd.conf, cmd.connRefuseNotify)
+		p, err := proxy.NewClient(ctx, cmd.dialer, cmd.logger, cmd.conf, cmd.connRefuseNotify, shutdownCh)
 		if err != nil {
 			cmd.logger.Debugf("Error starting proxy: %v", err)
 			shutdownCh <- fmt.Errorf("unable to start: %v", err)
 			return
 		}
 		startCh <- p
+
 	}()
 	// Wait for either startup to finish or a signal to interupt
 	var p *proxy.Client

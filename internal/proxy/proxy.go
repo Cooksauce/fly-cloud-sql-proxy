@@ -15,10 +15,16 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"regexp"
@@ -31,6 +37,7 @@ import (
 	"github.com/GoogleCloudPlatform/cloud-sql-proxy/v2/cloudsql"
 	"github.com/GoogleCloudPlatform/cloud-sql-proxy/v2/internal/gcloud"
 	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google/externalaccount"
 	"google.golang.org/api/impersonate"
 	"google.golang.org/api/option"
 	"google.golang.org/api/sqladmin/v1"
@@ -128,6 +135,18 @@ type Config struct {
 
 	// CredentialsJSON is a JSON representation of the service account key.
 	CredentialsJSON string
+
+	// ExtCredentialsAccount is the service account to impersonate for federated workload auth.
+	ExtCredentialsAccount string
+
+	// ExtCredentialsAudience is the token audience to use for federated workload auth.
+	ExtCredentialsAudience string
+
+	// ExtCredentialsTokenUrl is the token url to use for federated workload auth.
+	ExtCredentialsTokenUrl string
+
+	// External token proxy config used to handle token requests.
+	ExtProxyConfig *ExternalTokenProxyConfig
 
 	// GcloudAuth set whether to use gcloud's config helper to retrieve a
 	// token for authentication.
@@ -313,7 +332,7 @@ func parseImpersonationChain(chain string) (string, []string) {
 
 const iamLoginScope = "https://www.googleapis.com/auth/sqlservice.login"
 
-func credentialsOpt(c Config, l cloudsql.Logger) (cloudsqlconn.Option, error) {
+func credentialsOpt(c *Config, l cloudsql.Logger) (cloudsqlconn.Option, error) {
 	// If service account impersonation is configured, set up an impersonated
 	// credentials token source.
 	if c.ImpersonationChain != "" {
@@ -389,6 +408,13 @@ func credentialsOpt(c Config, l cloudsql.Logger) (cloudsqlconn.Option, error) {
 	case c.CredentialsJSON != "":
 		l.Infof("Authorizing with JSON credentials environment variable")
 		opt = cloudsqlconn.WithCredentialsJSON([]byte(c.CredentialsJSON))
+	case c.ExtCredentialsAccount != "":
+		l.Infof("Authorizing with federated workload id")
+		credsJSON, err := c.buildExternalCredentials(l)
+		if err != nil {
+			return nil, err
+		}
+		opt = cloudsqlconn.WithCredentialsJSON([]byte(credsJSON))
 	case c.GcloudAuth:
 		l.Infof("Authorizing with gcloud user credentials")
 		ts, err := gcloud.TokenSource()
@@ -404,13 +430,238 @@ func credentialsOpt(c Config, l cloudsql.Logger) (cloudsqlconn.Option, error) {
 	return opt, nil
 }
 
+func (c *Config) buildExternalCredentials(log cloudsql.Logger) ([]byte, error) {
+	// ex := "//iam.googleapis.com/projects/{123456}/locations/global/workloadIdentityPools/my-workloads-123/providers/my-provider-123"
+
+	tokenUrl, err := url.Parse(c.ExtCredentialsTokenUrl)
+	if err != nil {
+		return nil, err
+	}
+
+	// https://localhost/v1/tokens/oidc?proxy.method=post&proxy.scheme=unix&proxy.host=/.fly/api&proxy.body.audience=//iam.googleapis.com/projects/{123456}/locations/global/workloadIdentityPools/my-workloads-123/providers/my-provider-123
+	var callbackUrl *url.URL = nil
+	q := tokenUrl.Query()
+
+	if q.Has("proxy.method") {
+		c.ExtProxyConfig = &ExternalTokenProxyConfig{
+			Logger:     log,
+			ListenAddr: fmt.Sprintf("%s://%s", tokenUrl.Scheme, tokenUrl.Host),
+			Scheme:     tokenUrl.Scheme,
+			Host:       tokenUrl.Host,
+			Method:     strings.ToUpper(q.Get("proxy.method")),
+			Body:       map[string]string{},
+			DropQuery:  []string{"proxy.method"},
+		}
+		cfg := c.ExtProxyConfig
+
+		proxyScheme := q.Get("proxy.scheme")
+		if proxyScheme != "" {
+			cfg.Scheme = proxyScheme
+			cfg.DropQuery = append(cfg.DropQuery, "proxy.scheme")
+		}
+
+		proxyHost := q.Get("proxy.host")
+		if proxyHost != "" {
+			cfg.Host = proxyHost
+			cfg.DropQuery = append(cfg.DropQuery, "proxy.host")
+		}
+
+		for param := range maps.Keys(q) {
+			proxyBodyParam, found := strings.CutPrefix(param, "proxy.body.")
+			if found {
+				cfg.Body[proxyBodyParam] = q.Get(param)
+				cfg.DropQuery = append(cfg.DropQuery, param)
+			}
+		}
+
+		callbackUrl = tokenUrl
+	} else {
+		callbackUrl = tokenUrl
+	}
+
+	creds := credentialsFile{
+		Type:                           "external_account",
+		Audience:                       c.ExtCredentialsAudience,
+		SubjectTokenType:               "urn:ietf:params:oauth:token-type:jwt",
+		TokenInfoURL:                   "https://sts.googleapis.com/v1/introspect",
+		TokenURLExternal:               "https://sts.googleapis.com/v1/token",
+		ServiceAccountImpersonationURL: fmt.Sprintf("https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/%s:generateAccessToken", c.ExtCredentialsAccount),
+		CredentialSource: externalaccount.CredentialSource{
+			URL: callbackUrl.String(),
+		},
+	}
+
+	credJsonBytes, err := json.MarshalIndent(&creds, "  ", "  ")
+	if err != nil {
+		return nil, err
+	}
+
+	return credJsonBytes, nil
+}
+
+type credentialsFile struct {
+	Type string `json:"type"`
+
+	// External Account fields
+	Audience                       string                           `json:"audience"`
+	SubjectTokenType               string                           `json:"subject_token_type"`
+	TokenURLExternal               string                           `json:"token_url"`
+	TokenInfoURL                   string                           `json:"token_info_url"`
+	ServiceAccountImpersonationURL string                           `json:"service_account_impersonation_url"`
+	CredentialSource               externalaccount.CredentialSource `json:"credential_source"`
+}
+
+type ExternalTokenProxyConfig struct {
+	Logger       cloudsql.Logger   `json:"-"`
+	ListenAddr   string            `json:"listen_addr"`
+	Scheme       string            `json:"scheme"`
+	Host         string            `json:"host"`
+	Method       string            `json:"method"`
+	Body         map[string]string `json:"body"`
+	DropQuery    []string          `json:"drop_query"`
+	ActiveServer *http.Server      `json:"-"`
+}
+
+func (cfg *ExternalTokenProxyConfig) ServeHTTP(res http.ResponseWriter, req *http.Request) {
+	cfg.Logger.Debugf("Received token request with url: %s", req.URL.String())
+
+	udsDialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
+	client := http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, n, a string) (net.Conn, error) {
+				if cfg.Scheme == "unix" {
+					return udsDialer.DialContext(ctx, "unix", cfg.Host)
+				}
+				return udsDialer.DialContext(ctx, "tcp", cfg.Host)
+			},
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
+
+	reqBytes, err := json.Marshal(cfg.Body)
+	if err != nil {
+		sendError(res, err, "Failed to serialize request body")
+		return
+	}
+
+	req.URL.Host = req.Host
+	if req.TLS == nil {
+		req.URL.Scheme = "http"
+	} else {
+		req.URL.Scheme = "https"
+	}
+
+	url := *req.URL
+	if cfg.Scheme != "unix" {
+		url.Scheme = cfg.Scheme
+		url.Host = cfg.Host
+	} else {
+		url.Scheme = req.URL.Scheme
+		url.Host = req.URL.Host
+	}
+	query := url.Query()
+	for _, k := range cfg.DropQuery {
+		query.Del(k)
+	}
+
+	// cfg.Logger.Debugf("Fowarding request %s", req.URL.String())
+	// cfg.Logger.Debugf("Sending upstream request %s", url.String())
+
+	upstreamReq, err := http.NewRequestWithContext(req.Context(), cfg.Method, url.String(), bytes.NewReader(reqBytes))
+	if err != nil {
+		sendError(res, err, "Failed to create request")
+		return
+	}
+	defer upstreamReq.Body.Close()
+
+	if cfg.Method == "POST" {
+		upstreamReq.Header.Set("Content-Type", "application/json")
+	}
+
+	upstreamRes, err := client.Do(upstreamReq)
+
+	if err != nil {
+		sendError(res, err, "Failed to send upstream request")
+		return
+	}
+	defer upstreamRes.Body.Close()
+
+	hdr := res.Header()
+	for k := range maps.Keys(upstreamRes.Header) {
+		hdr.Set(k, upstreamRes.Header.Get(k))
+	}
+
+	res.WriteHeader(upstreamRes.StatusCode)
+	bodyLen, err := io.Copy(res, upstreamRes.Body)
+	if err != nil {
+		cfg.Logger.Errorf(fmt.Sprintf("Failed to copy response body: %s", err.Error()))
+	}
+	cfg.Logger.Debugf("Served token response. %d bytes.", bodyLen)
+}
+
+func sendError(res http.ResponseWriter, err error, prefix string) {
+	http.Error(res, fmt.Sprintf("%s: %s", prefix, err.Error()), 500)
+}
+
+func ServeExternalToken(ctx context.Context, cfg *ExternalTokenProxyConfig, shutdownCh chan<- error) {
+	if cfg == nil {
+		os.Stderr.WriteString("cfg is nil")
+		return
+	}
+	if cfg.Logger == nil {
+		os.Stderr.WriteString("cfg.Logger is nil")
+		return
+	}
+
+	listenUrl, _ := url.Parse(cfg.ListenAddr)
+
+	cfg.Logger.Debugf("Starting external token proxy on address %s", listenUrl.Host)
+
+	cfg.ActiveServer = &http.Server{
+		Addr:    listenUrl.Host,
+		Handler: cfg,
+	}
+
+	if listenUrl.Scheme == "https" {
+		cfg.Logger.Errorf("Scheme not supported: %s", listenUrl.Scheme)
+		return
+	}
+
+	go func() {
+		err := cfg.ActiveServer.ListenAndServe()
+		if errors.Is(err, http.ErrServerClosed) {
+			return
+		}
+		if err != nil {
+			shutdownCh <- fmt.Errorf("failed to start HTTP token proxy server: %v", err)
+		}
+	}()
+
+	// Handle shutdown of the HTTP server gracefully.
+	<-ctx.Done()
+	// Give the HTTP server a second to shut down cleanly.
+	ctx2, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := cfg.ActiveServer.Shutdown(ctx2); err != nil {
+		cfg.Logger.Errorf("failed to shutdown HTTP token proxy server: %v\n", err)
+	}
+}
+
 // DialerOptions builds appropriate list of options from the Config
 // values for use by cloudsqlconn.NewClient()
 func (c *Config) DialerOptions(l cloudsql.Logger) ([]cloudsqlconn.Option, error) {
 	opts := []cloudsqlconn.Option{
 		cloudsqlconn.WithUserAgent(c.UserAgent),
 	}
-	co, err := credentialsOpt(*c, l)
+	co, err := credentialsOpt(c, l)
 	if err != nil {
 		return nil, err
 	}
@@ -510,7 +761,8 @@ type Client struct {
 
 // NewClient completes the initial setup required to get the proxy to a "steady"
 // state.
-func NewClient(ctx context.Context, d cloudsql.Dialer, l cloudsql.Logger, conf *Config, connRefuseNotify func()) (*Client, error) {
+func NewClient(ctx context.Context, d cloudsql.Dialer, l cloudsql.Logger, conf *Config, connRefuseNotify func(), shutdownCh chan<- error) (*Client, error) {
+
 	// Check if the caller has configured a dialer.
 	// Otherwise, initialize a new one.
 	if d == nil {
@@ -522,6 +774,10 @@ func NewClient(ctx context.Context, d cloudsql.Dialer, l cloudsql.Logger, conf *
 		if err != nil {
 			return nil, fmt.Errorf("error initializing dialer: %v", err)
 		}
+	}
+
+	if conf.ExtProxyConfig != nil {
+		go ServeExternalToken(ctx, conf.ExtProxyConfig, shutdownCh)
 	}
 
 	c := &Client{
