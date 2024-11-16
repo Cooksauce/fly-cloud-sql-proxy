@@ -25,17 +25,13 @@ RUN go get ./...
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -ldflags "-X github.com/GoogleCloudPlatform/cloud-sql-proxy/v2/cmd.metadataString=container"
 
-RUN mkdir /.fly
-RUN chmod 777 /.fly
-
 # Final Stage
 FROM gcr.io/distroless/static:nonroot@sha256:26f9b99f2463f55f20db19feb4d96eb88b056e0f1be7016bb9296a464a89d772
 
 LABEL org.opencontainers.image.source="https://github.com/GoogleCloudPlatform/cloud-sql-proxy"
 
 COPY --from=build --chown=nonroot /go/src/cloud-sql-proxy/cloud-sql-proxy /cloud-sql-proxy
-COPY --from=build /.fly /.fly
 
 # set the uid as an integer for compatibility with runAsNonRoot in Kubernetes
-USER 65532
+# USER 65532
 ENTRYPOINT ["/cloud-sql-proxy"]
