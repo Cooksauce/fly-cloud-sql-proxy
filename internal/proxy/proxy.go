@@ -446,30 +446,29 @@ func (c *Config) buildExternalCredentials(log cloudsql.Logger) ([]byte, error) {
 		c.ExtProxyConfig = &ExternalTokenProxyConfig{
 			Logger:     log,
 			ListenAddr: fmt.Sprintf("%s://%s", tokenUrl.Scheme, tokenUrl.Host),
-			Scheme:     tokenUrl.Scheme,
-			Host:       tokenUrl.Host,
+			UnixSocket: q.Get("proxy.unix"),
+			Scheme:     q.Get("proxy.scheme"),
+			Host:       q.Get("proxy.host"),
 			Method:     strings.ToUpper(q.Get("proxy.method")),
 			Body:       map[string]string{},
 			DropQuery:  []string{"proxy.method"},
 		}
 		cfg := c.ExtProxyConfig
 
-		proxyScheme := q.Get("proxy.scheme")
-		if proxyScheme != "" {
-			cfg.Scheme = proxyScheme
+		if cfg.UnixSocket != "" {
+			cfg.DropQuery = append(cfg.DropQuery, "proxy.unix")
+		}
+		if cfg.Scheme != "" {
 			cfg.DropQuery = append(cfg.DropQuery, "proxy.scheme")
 		}
-
-		proxyHost := q.Get("proxy.host")
-		if proxyHost != "" {
-			cfg.Host = proxyHost
+		if cfg.Host != "" {
 			cfg.DropQuery = append(cfg.DropQuery, "proxy.host")
 		}
 
 		for param := range maps.Keys(q) {
 			proxyBodyParam, found := strings.CutPrefix(param, "proxy.body.")
 			if found {
-				cfg.Body[proxyBodyParam] = q.Get(param)
+				cfg.Body[proxyBodyParam] = param
 				cfg.DropQuery = append(cfg.DropQuery, param)
 			}
 		}
@@ -514,6 +513,7 @@ type credentialsFile struct {
 type ExternalTokenProxyConfig struct {
 	Logger       cloudsql.Logger   `json:"-"`
 	ListenAddr   string            `json:"listen_addr"`
+	UnixSocket   string            `json:"unix_socket"`
 	Scheme       string            `json:"scheme"`
 	Host         string            `json:"host"`
 	Method       string            `json:"method"`
@@ -523,35 +523,8 @@ type ExternalTokenProxyConfig struct {
 }
 
 func (cfg *ExternalTokenProxyConfig) ServeHTTP(res http.ResponseWriter, req *http.Request) {
-	cfg.Logger.Debugf("Received token request with url: %s", req.URL.String())
-
-	udsDialer := &net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-
-	client := http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, n, a string) (net.Conn, error) {
-				if cfg.Scheme == "unix" {
-					return udsDialer.DialContext(ctx, "unix", cfg.Host)
-				}
-				return udsDialer.DialContext(ctx, "tcp", cfg.Host)
-			},
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
-	}
-
-	reqBytes, err := json.Marshal(cfg.Body)
-	if err != nil {
-		sendError(res, err, "Failed to serialize request body")
-		return
-	}
-
+	cfg.Logger.Debugf("Received token request")
+	// patch req.URL
 	req.URL.Host = req.Host
 	if req.TLS == nil {
 		req.URL.Scheme = "http"
@@ -559,21 +532,58 @@ func (cfg *ExternalTokenProxyConfig) ServeHTTP(res http.ResponseWriter, req *htt
 		req.URL.Scheme = "https"
 	}
 
+	cfg.Logger.Debugf("Received token request with url: %s", req.URL.String())
+
 	url := *req.URL
-	if cfg.Scheme != "unix" {
+	if cfg.Scheme != "" {
 		url.Scheme = cfg.Scheme
-		url.Host = cfg.Host
-	} else {
-		url.Scheme = req.URL.Scheme
-		url.Host = req.URL.Host
 	}
+	if cfg.Host != "" {
+		url.Host = cfg.Host
+	}
+
+	body := map[string]string{}
 	query := url.Query()
+
+	for k, v := range cfg.Body {
+		body[k] = query.Get(v)
+	}
+	reqBytes, err := json.Marshal(body)
+	if err != nil {
+		sendError(res, err, "Failed to serialize request body")
+		return
+	}
+
 	for _, k := range cfg.DropQuery {
 		query.Del(k)
 	}
+	url.RawQuery = query.Encode()
 
-	// cfg.Logger.Debugf("Fowarding request %s", req.URL.String())
-	// cfg.Logger.Debugf("Sending upstream request %s", url.String())
+	udsDialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
+	dial := udsDialer.DialContext
+	if cfg.UnixSocket != "" {
+		dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+			return udsDialer.DialContext(ctx, "unix", cfg.UnixSocket)
+		}
+		cfg.Logger.Debugf("Sending upstream request on sock: %s: %s", cfg.UnixSocket, url.String())
+	} else {
+		cfg.Logger.Debugf("Sending upstream request: %s", url.String())
+	}
+
+	client := http.Client{
+		Transport: &http.Transport{
+			DialContext:           dial,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
 
 	upstreamReq, err := http.NewRequestWithContext(req.Context(), cfg.Method, url.String(), bytes.NewReader(reqBytes))
 	if err != nil {
@@ -623,7 +633,8 @@ func ServeExternalToken(ctx context.Context, cfg *ExternalTokenProxyConfig, shut
 
 	listenUrl, _ := url.Parse(cfg.ListenAddr)
 
-	cfg.Logger.Debugf("Starting external token proxy on address %s", listenUrl.Host)
+	cfg.Logger.Infof("Starting external token proxy on address %s", listenUrl.Host)
+	cfg.Logger.Debugf("External token proxy config: %+v", cfg)
 
 	cfg.ActiveServer = &http.Server{
 		Addr:    listenUrl.Host,
