@@ -33,5 +33,5 @@ LABEL org.opencontainers.image.source="https://github.com/GoogleCloudPlatform/cl
 COPY --from=build --chown=nonroot /go/src/cloud-sql-proxy/cloud-sql-proxy /cloud-sql-proxy
 
 # set the uid as an integer for compatibility with runAsNonRoot in Kubernetes
-# USER 65532
+USER root
 ENTRYPOINT ["/cloud-sql-proxy"]
