@@ -571,14 +571,18 @@ func (cfg *ExternalTokenProxyConfig) ServeHTTP(res http.ResponseWriter, req *htt
 		if err != nil {
 			sendError(res, err, fmt.Sprintf("unable to find socket at %s", cfg.UnixSocket))
 			return
+		} else {
+			cfg.Logger.Debugf("found socket at %s", cfg.UnixSocket)
 		}
 		if fileInfo.Mode().Type() != fs.ModeSocket {
 			sendError(res, fmt.Errorf("unexpected file mode: %s", fileInfo.Mode().String()), fmt.Sprintf("unable to open socket at %s", cfg.UnixSocket))
 			return
+		} else {
+			cfg.Logger.Debugf("socket has expected type %s", fileInfo.Mode())
 		}
 		c, err := udsDialer.DialContext(req.Context(), "unix", cfg.UnixSocket)
 		if err != nil {
-			sendError(res, err, "unable to dial")
+			sendError(res, err, "test dial failed")
 			return
 		} else {
 			c.Close()
