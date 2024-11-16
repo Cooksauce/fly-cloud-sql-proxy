@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"net"
 	"net/http"
@@ -566,6 +567,23 @@ func (cfg *ExternalTokenProxyConfig) ServeHTTP(res http.ResponseWriter, req *htt
 
 	dial := udsDialer.DialContext
 	if cfg.UnixSocket != "" {
+		fileInfo, err := os.Stat(cfg.UnixSocket)
+		if err != nil {
+			sendError(res, err, fmt.Sprintf("unable to find socket at %s", cfg.UnixSocket))
+			return
+		}
+		if fileInfo.Mode().Type() != fs.ModeSocket {
+			sendError(res, fmt.Errorf("unexpected file mode: %s", fileInfo.Mode().String()), fmt.Sprintf("unable to open socket at %s", cfg.UnixSocket))
+			return
+		}
+		c, err := udsDialer.DialContext(req.Context(), "unix", cfg.UnixSocket)
+		if err != nil {
+			sendError(res, err, "unable to dial")
+			return
+		} else {
+			c.Close()
+		}
+
 		dial = func(ctx context.Context, network, address string) (net.Conn, error) {
 			return udsDialer.DialContext(ctx, "unix", cfg.UnixSocket)
 		}
