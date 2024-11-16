@@ -19,6 +19,7 @@ package main
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"strconv"
 	"syscall"
@@ -31,29 +32,31 @@ func main() {
 	sockPath := os.Getenv("RUN_GRANT_SOCK")
 	fileInfo, err := os.Stat(sockPath)
 	if err != nil {
-		os.Stderr.WriteString(fmt.Errorf("failed to get socket info at %s: %w", sockPath, err).Error())
+		os.Stderr.WriteString(fmt.Errorf("failed to get socket info at %s: %w", sockPath, err).Error() + "\n")
 		os.Exit(1)
 		return
 	}
 
 	user, err := strconv.ParseInt(userStr, 10, 0)
 	if err != nil {
-		os.Stderr.WriteString(fmt.Errorf("failed to parse user %s: %w", userStr, err).Error())
+		os.Stderr.WriteString(fmt.Errorf("failed to parse user %s: %w", userStr, err).Error() + "\n")
 		os.Exit(1)
 		return
 	}
 
+	permAll, _ := strconv.ParseUint("0777", 8, 32)
+
 	mode := fileInfo.Mode()
-	modeNew := mode | 777
+	modeNew := mode | fs.FileMode(permAll)
 
 	if err := os.Chmod(sockPath, modeNew); err != nil {
 		os.Stderr.WriteString(err.Error())
 		os.Exit(1)
 	}
-	os.Stdout.WriteString(fmt.Sprintf("changed %s mode from %s to %s", sockPath, mode, modeNew))
+	os.Stdout.WriteString(fmt.Sprintf("changed %s mode from %s to %s", sockPath, mode, modeNew) + "\n")
 
 	if err := syscall.Setuid(int(user)); err != nil {
-		os.Stderr.WriteString(err.Error())
+		os.Stderr.WriteString(err.Error() + "\n")
 		os.Exit(1)
 	}
 
