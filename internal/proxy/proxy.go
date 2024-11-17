@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"maps"
 	"net"
 	"net/http"
@@ -432,14 +431,11 @@ func credentialsOpt(c *Config, l cloudsql.Logger) (cloudsqlconn.Option, error) {
 }
 
 func (c *Config) buildExternalCredentials(log cloudsql.Logger) ([]byte, error) {
-	// ex := "//iam.googleapis.com/projects/{123456}/locations/global/workloadIdentityPools/my-workloads-123/providers/my-provider-123"
-
 	tokenUrl, err := url.Parse(c.ExtCredentialsTokenUrl)
 	if err != nil {
 		return nil, err
 	}
 
-	// https://localhost/v1/tokens/oidc?proxy.method=post&proxy.scheme=unix&proxy.host=/.fly/api&proxy.body.audience=//iam.googleapis.com/projects/{123456}/locations/global/workloadIdentityPools/my-workloads-123/providers/my-provider-123
 	var callbackUrl *url.URL = nil
 	q := tokenUrl.Query()
 
@@ -535,30 +531,25 @@ func (cfg *ExternalTokenProxyConfig) ServeHTTP(res http.ResponseWriter, req *htt
 
 	cfg.Logger.Debugf("Received token request with url: %s", req.URL.String())
 
-	url := *req.URL
+	upUrl := *req.URL
 	if cfg.Scheme != "" {
-		url.Scheme = cfg.Scheme
+		upUrl.Scheme = cfg.Scheme
 	}
 	if cfg.Host != "" {
-		url.Host = cfg.Host
+		upUrl.Host = cfg.Host
 	}
 
-	body := map[string]string{}
-	query := url.Query()
+	upBody := map[string]string{}
+	upQuery := upUrl.Query()
 
 	for k, v := range cfg.Body {
-		body[k] = query.Get(v)
-	}
-	reqBytes, err := json.Marshal(body)
-	if err != nil {
-		sendError(res, err, "Failed to serialize request body")
-		return
+		upBody[k] = upQuery.Get(v)
 	}
 
 	for _, k := range cfg.DropQuery {
-		query.Del(k)
+		upQuery.Del(k)
 	}
-	url.RawQuery = query.Encode()
+	upUrl.RawQuery = upQuery.Encode()
 
 	udsDialer := &net.Dialer{
 		Timeout:   30 * time.Second,
@@ -567,33 +558,12 @@ func (cfg *ExternalTokenProxyConfig) ServeHTTP(res http.ResponseWriter, req *htt
 
 	dial := udsDialer.DialContext
 	if cfg.UnixSocket != "" {
-		fileInfo, err := os.Stat(cfg.UnixSocket)
-		if err != nil {
-			sendError(res, err, fmt.Sprintf("unable to find socket at %s", cfg.UnixSocket))
-			return
-		} else {
-			cfg.Logger.Debugf("found socket at %s", cfg.UnixSocket)
-		}
-		if fileInfo.Mode().Type() != fs.ModeSocket {
-			sendError(res, fmt.Errorf("unexpected file mode: %s", fileInfo.Mode().String()), fmt.Sprintf("unable to open socket at %s", cfg.UnixSocket))
-			return
-		} else {
-			cfg.Logger.Debugf("socket has expected type %s", fileInfo.Mode())
-		}
-		c, err := udsDialer.DialContext(req.Context(), "unix", cfg.UnixSocket)
-		if err != nil {
-			sendError(res, err, "test dial failed")
-			return
-		} else {
-			c.Close()
-		}
-
 		dial = func(ctx context.Context, network, address string) (net.Conn, error) {
 			return udsDialer.DialContext(ctx, "unix", cfg.UnixSocket)
 		}
-		cfg.Logger.Debugf("Sending upstream request on sock: %s: %s", cfg.UnixSocket, url.String())
+		cfg.Logger.Debugf("Sending upstream request on sock: %s: %s", cfg.UnixSocket, upUrl.String())
 	} else {
-		cfg.Logger.Debugf("Sending upstream request: %s", url.String())
+		cfg.Logger.Debugf("Sending upstream request: %s", upUrl.String())
 	}
 
 	client := http.Client{
@@ -607,43 +577,50 @@ func (cfg *ExternalTokenProxyConfig) ServeHTTP(res http.ResponseWriter, req *htt
 		},
 	}
 
-	upstreamReq, err := http.NewRequestWithContext(req.Context(), cfg.Method, url.String(), bytes.NewReader(reqBytes))
+	upBodyBytes, err := json.Marshal(upBody)
+	if err != nil {
+		sendError(res, err, "Failed to serialize request body")
+		return
+	}
+
+	upRequest, err := http.NewRequestWithContext(req.Context(), cfg.Method, upUrl.String(), bytes.NewReader(upBodyBytes))
 	if err != nil {
 		sendError(res, err, "Failed to create request")
 		return
 	}
-	defer upstreamReq.Body.Close()
+	defer upRequest.Body.Close()
 
 	if cfg.Method == "POST" {
-		upstreamReq.Header.Set("Content-Type", "application/json")
+		upRequest.Header.Set("Content-Type", "application/json")
 	}
 
-	upstreamRes, err := client.Do(upstreamReq)
+	upResponse, err := client.Do(upRequest)
 
 	if err != nil {
 		sendError(res, err, "Failed to send upstream request")
 		return
 	}
-	defer upstreamRes.Body.Close()
+	defer upResponse.Body.Close()
 
 	hdr := res.Header()
-	for k := range maps.Keys(upstreamRes.Header) {
-		hdr.Set(k, upstreamRes.Header.Get(k))
+	for k := range maps.Keys(upResponse.Header) {
+		hdr.Set(k, upResponse.Header.Get(k))
 	}
 
-	res.WriteHeader(upstreamRes.StatusCode)
-	bodyLen, err := io.Copy(res, upstreamRes.Body)
+	res.WriteHeader(upResponse.StatusCode)
+	bodyLen, err := io.Copy(res, upResponse.Body)
 	if err != nil {
 		cfg.Logger.Errorf(fmt.Sprintf("Failed to copy response body: %s", err.Error()))
+	} else {
+		cfg.Logger.Debugf("Served token response. %d bytes.", bodyLen)
 	}
-	cfg.Logger.Debugf("Served token response. %d bytes.", bodyLen)
 }
 
 func sendError(res http.ResponseWriter, err error, prefix string) {
 	http.Error(res, fmt.Sprintf("%s: %s", prefix, err.Error()), 500)
 }
 
-func ServeExternalToken(ctx context.Context, cfg *ExternalTokenProxyConfig, shutdownCh chan<- error) {
+func serveExternalToken(ctx context.Context, cfg *ExternalTokenProxyConfig, shutdownCh chan<- error) {
 	if cfg == nil {
 		os.Stderr.WriteString("cfg is nil")
 		return
@@ -810,7 +787,7 @@ func NewClient(ctx context.Context, d cloudsql.Dialer, l cloudsql.Logger, conf *
 	}
 
 	if conf.ExtProxyConfig != nil {
-		go ServeExternalToken(ctx, conf.ExtProxyConfig, shutdownCh)
+		go serveExternalToken(ctx, conf.ExtProxyConfig, shutdownCh)
 	}
 
 	c := &Client{
