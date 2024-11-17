@@ -17,6 +17,8 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -158,6 +160,12 @@ type Config struct {
 	// Port is the initial port to bind to. Subsequent instances bind to
 	// increments from this value.
 	Port int
+
+	// Base64 encoded bytes to use for a TLS key on the listener
+	TLSKeyBase64 string
+
+	// Base64 encoded bytes to use for a TLS cert on the listener
+	TLSCertBase64 string
 
 	// APIEndpointURL is the URL of the Google Cloud SQL Admin API. When left blank,
 	// the proxy will use the main public api: https://sqladmin.googleapis.com/
@@ -1124,6 +1132,36 @@ func (c *Client) newSocketMount(ctx context.Context, conf *Config, pc *portConfi
 		c.logger.Errorf("[%v] could not listen to address %v: %v", inst.Name, address, err)
 		return nil, err
 	}
+
+	if conf.TLSKeyBase64 != "" {
+		if conf.TLSCertBase64 == "" {
+			ln.Close()
+			return nil, fmt.Errorf("tls cert is required with tls key")
+		}
+
+		keyBytes, err := base64.StdEncoding.DecodeString(conf.TLSKeyBase64)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode tls key: %w", err)
+		}
+
+		certBytes, err := base64.StdEncoding.DecodeString(conf.TLSCertBase64)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode tls cert: %w", err)
+		}
+
+		cert, err := tls.X509KeyPair(certBytes, keyBytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse tls key pair: %w", err)
+		}
+
+		tlsCfg := tls.Config{
+			Certificates: []tls.Certificate{cert},
+		}
+
+		// wrap in TLS listener
+		ln = tls.NewListener(ln, &tlsCfg)
+	}
+
 	// Change file permissions to allow access for user, group, and other.
 	if network == "unix" {
 		// Best effort. If this call fails, group and other won't have write

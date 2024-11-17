@@ -42,6 +42,10 @@ func main() {
 }
 
 func changeUser(userStr string) error {
+	if userStr == "" {
+		return nil
+	}
+
 	user, err := strconv.ParseInt(userStr, 10, 0)
 	if err != nil {
 		return fmt.Errorf("failed to parse user %s: %w", userStr, err)
@@ -55,6 +59,10 @@ func changeUser(userStr string) error {
 }
 
 func grantSocket(sockPath string) error {
+	if sockPath == "" {
+		return nil
+	}
+
 	fileInfo, err := os.Stat(sockPath)
 	if err != nil {
 		return fmt.Errorf("failed to get socket info at %s: %w", sockPath, err)

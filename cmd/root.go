@@ -540,6 +540,10 @@ status code.`)
 		"(*) Address to bind Cloud SQL instance listeners.")
 	localFlags.IntVarP(&c.conf.Port, "port", "p", 0,
 		"(*) Initial port for listeners. Subsequent listeners increment from this value.")
+	localFlags.StringVar(&c.conf.TLSKeyBase64, "tls-key-b64", "",
+		"(*) TLS key to use for on the Cloud SQL instance listeners (base54 encoded).")
+	localFlags.StringVar(&c.conf.TLSCertBase64, "tls-cert-b64", "",
+		"(*) TLS cert to use for on the Cloud SQL instance listeners (base54 encoded).")
 	localFlags.StringVarP(&c.conf.UnixSocket, "unix-socket", "u", "",
 		`(*) Enables Unix sockets for all listeners with the provided directory.`)
 	localFlags.BoolVarP(&c.conf.IAMAuthN, "auto-iam-authn", "i", false,
@@ -789,6 +793,13 @@ func parseConfig(cmd *Command, conf *proxy.Config, args []string) error {
 	}
 	if conf.ExtCredentialsTokenUrl != "" && multLen == 0 {
 		return newBadCommandError("--ext-credentials-account, --ext-credentials-audience, and --ext-credentials-token-url must used together")
+	}
+
+	if conf.TLSKeyBase64 != "" && conf.TLSCertBase64 == "" {
+		return newBadCommandError("--tls-cert-b64 must be used with --tls-key-b64")
+	}
+	if conf.TLSKeyBase64 == "" && conf.TLSCertBase64 != "" {
+		return newBadCommandError("--tls-key-b64 must be used with --tls-cert-b64")
 	}
 
 	// When using token with auto-iam-authn, login-token must also be set.
