@@ -805,6 +805,10 @@ func NewClient(ctx context.Context, d cloudsql.Dialer, l cloudsql.Logger, conf *
 		conf:             conf,
 	}
 
+	// c.dialer = TempDialer{
+	// 	inner: net.Dialer{},
+	// }
+
 	if conf.FUSEDir != "" {
 		return configureFUSE(c, conf)
 	}
@@ -817,7 +821,7 @@ func NewClient(ctx context.Context, d cloudsql.Dialer, l cloudsql.Logger, conf *
 	var mnts []*socketMount
 	pc := newPortConfig(conf.Port)
 	for _, inst := range conf.Instances {
-		m, err := c.newSocketMount(ctx, conf, pc, inst)
+		m, err := c.newSocketMount(ctx, conf, pc, inst, l)
 		if err != nil {
 			for _, m := range mnts {
 				mErr := m.Close()
@@ -1067,7 +1071,7 @@ func networkType(conf *Config, inst InstanceConnConfig) string {
 	return "unix"
 }
 
-func (c *Client) newSocketMount(ctx context.Context, conf *Config, pc *portConfig, inst InstanceConnConfig) (*socketMount, error) {
+func (c *Client) newSocketMount(ctx context.Context, conf *Config, pc *portConfig, inst InstanceConnConfig, log cloudsql.Logger) (*socketMount, error) {
 	var (
 		// network is one of "tcp" or "unix"
 		network string
@@ -1159,7 +1163,15 @@ func (c *Client) newSocketMount(ctx context.Context, conf *Config, pc *portConfi
 		}
 
 		// wrap in TLS listener
-		ln = tls.NewListener(ln, &tlsCfg)
+		log.Debugf("using postgres TLS listener")
+		pgLn := PgTLSListener{
+			inner: ln,
+			cfg:   &tlsCfg,
+			log:   log,
+		}
+
+		ln = pgLn
+		// ln = tls.NewListener(ln, &tlsCfg)
 	}
 
 	// Change file permissions to allow access for user, group, and other.
