@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Use the latest stable golang 1.x to compile to a binary
-FROM --platform=$BUILDPLATFORM golang:1 as build
+FROM --platform=$BUILDPLATFORM golang:1 AS build
 
 WORKDIR /go/src/cloud-sql-proxy
 COPY . .
@@ -31,6 +31,7 @@ FROM gcr.io/distroless/static:nonroot@sha256:26f9b99f2463f55f20db19feb4d96eb88b0
 LABEL org.opencontainers.image.source="https://github.com/GoogleCloudPlatform/cloud-sql-proxy"
 
 COPY --from=build --chown=nonroot /go/src/cloud-sql-proxy/cloud-sql-proxy /cloud-sql-proxy
+
 # set the uid as an integer for compatibility with runAsNonRoot in Kubernetes
-USER 65532
+USER root
 ENTRYPOINT ["/cloud-sql-proxy"]

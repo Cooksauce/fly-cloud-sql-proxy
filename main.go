@@ -18,9 +18,65 @@
 package main
 
 import (
+	"fmt"
+	"io/fs"
+	"os"
+	"strconv"
+	"syscall"
+
 	"github.com/GoogleCloudPlatform/cloud-sql-proxy/v2/cmd"
 )
 
 func main() {
+	if err := grantSocket(os.Getenv("GRANT_SOCK")); err != nil {
+		os.Stderr.WriteString(fmt.Errorf("failed to grant socket: %w", err).Error() + "\n")
+		os.Exit(1)
+	}
+
+	if err := changeUser(os.Getenv("SWITCH_USER")); err != nil {
+		os.Stderr.WriteString(fmt.Errorf("failed to switch user: %w", err).Error() + "\n")
+		os.Exit(1)
+	}
+
 	cmd.Execute()
+}
+
+func changeUser(userStr string) error {
+	if userStr == "" {
+		return nil
+	}
+
+	user, err := strconv.ParseInt(userStr, 10, 0)
+	if err != nil {
+		return fmt.Errorf("failed to parse user %s: %w", userStr, err)
+	}
+
+	if err := syscall.Setuid(int(user)); err != nil {
+		return fmt.Errorf("failed to set user %s: %w", userStr, err)
+	}
+
+	return nil
+}
+
+func grantSocket(sockPath string) error {
+	if sockPath == "" {
+		return nil
+	}
+
+	fileInfo, err := os.Stat(sockPath)
+	if err != nil {
+		return fmt.Errorf("failed to get socket info at %s: %w", sockPath, err)
+	}
+
+	permAll, _ := strconv.ParseUint("0777", 8, 32)
+
+	mode := fileInfo.Mode()
+	modeNew := mode | fs.FileMode(permAll)
+
+	if err := os.Chmod(sockPath, modeNew); err != nil {
+		os.Stderr.WriteString(err.Error())
+		os.Exit(1)
+	}
+	os.Stdout.WriteString(fmt.Sprintf("changed %s mode from %s to %s", sockPath, mode, modeNew) + "\n")
+	return nil
 }

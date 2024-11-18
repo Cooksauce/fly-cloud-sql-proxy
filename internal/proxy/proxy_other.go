@@ -25,6 +25,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/GoogleCloudPlatform/cloud-sql-proxy/v2/cloudsql"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
@@ -100,7 +101,7 @@ func (c *Client) Readdir(_ context.Context) (fs.DirStream, syscall.Errno) {
 // socket is connected to the requested Cloud SQL instance. Lookup returns a
 // symlink (instead of the socket itself) so that multiple callers all use the
 // same Unix socket.
-func (c *Client) Lookup(_ context.Context, instance string, _ *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+func (c *Client) Lookup(_ context.Context, instance string, _ *fuse.EntryOut, log cloudsql.Logger) (*fs.Inode, syscall.Errno) {
 	ctx := context.Background()
 	if instance == "README" {
 		return c.NewInode(ctx, &readme{}, fs.StableAttr{}), fs.OK
@@ -122,6 +123,7 @@ func (c *Client) Lookup(_ context.Context, instance string, _ *fuse.EntryOut) (*
 	s, err := c.newSocketMount(
 		ctx, withUnixSocket(*c.conf, c.fuseTempDir),
 		nil, InstanceConnConfig{Name: instance},
+		log,
 	)
 	if err != nil {
 		c.logger.Errorf("could not create socket for %q: %v", instance, err)
